@@ -968,16 +968,44 @@
                     log('Attempting to flash anyway...', 'info');
                 }
                 
-                // Reconnect for flashing (device was reset)
-                log('Reconnecting for firmware flashing...', 'info');
-                await dap.reconnect();
+                // CRITICAL: Create a fresh DAP instance for flashing
+                // The previous DAP instance has its internal DP.SELECT cache pointing to CTRL-AP (AP #2)
+                // after our mass erase operations. DAP.js caches the selectedAddress and may skip
+                // DP.SELECT writes, causing memory operations to go to the wrong AP.
+                // Creating a new instance ensures clean state with MEM-AP (AP #0) selected.
+                log('Creating fresh DAP connection for firmware flashing...', 'info');
+                await dap.disconnect();
+                await sleep(200);
+                
+                // Create new DAP instance with clean state
+                const flashDap = new DAPjs.ADI(transport);
+                await flashDap.connect();
+                log('Connected for flashing', 'success');
                 
                 // Additional delay to ensure device is ready for programming
                 await sleep(200);
                 
+                // Verify MEM-AP is accessible by reading address 0x0 before flashing
+                log('Verifying memory access before flashing...', 'info');
+                try {
+                    const testRead = await flashDap.readMem32(0);
+                    log(`Pre-flash memory read at 0x0: 0x${testRead.toString(16)}`, 'info');
+                    if (testRead === 0xFFFFFFFF) {
+                        log('Memory appears erased (0xFFFFFFFF), ready for programming', 'success');
+                    } else if (testRead === 0) {
+                        log('Warning: Memory read returned 0x0, MEM-AP may not be accessible', 'warning');
+                    }
+                } catch (memError) {
+                    log(`Memory access error: ${memError.message}`, 'warning');
+                    log('Attempting to flash anyway...', 'info');
+                }
+                
                 // Flash firmware
                 updateProgress(80, 'Flashing firmware...');
-                await flashFirmware(dap, firmware.data, firmware.startAddress);
+                await flashFirmware(flashDap, firmware.data, firmware.startAddress);
+                
+                // Use flashDap for remaining operations
+                dap = flashDap;
                 
                 // Reset device after flashing
                 log('Resetting device...', 'info');
