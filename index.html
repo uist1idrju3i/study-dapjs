@@ -1200,15 +1200,15 @@
                 dap = await performMassErase(transport);
                 
                 // Check if device is unlocked before proceeding to flash
-                // nRF54L15 uses RRAMC (Resistive Random Access Memory Controller) which has
-                // protection regions. After mass erase, the device may need a power cycle
-                // for the unlock to take effect.
+                // Note: ERASEPROTECTSTATUS interpretation may vary by device. On nRF54L15,
+                // the status value semantics are not fully documented. We treat this as
+                // informational only and proceed with flashing regardless, letting the
+                // actual write operations determine if the device is accessible.
+                // This matches pyocd's behavior which doesn't check this status.
                 if (dap._isUnlocked === false) {
-                    log('ERROR: Device is still locked after mass erase.', 'error');
-                    log('The nRF54L15 RRAMC protection is still active.', 'error');
-                    log('Please power cycle the device (unplug and replug USB) and try again.', 'error');
-                    log('If the problem persists, the device may need recovery via pyocd.', 'warning');
-                    throw new Error('Device is still locked. Please power cycle and retry.');
+                    log('Note: ERASEPROTECTSTATUS indicates device may still be protected.', 'warning');
+                    log('This is informational only - proceeding with flash attempt.', 'info');
+                    log('If flashing fails, try power cycling the device.', 'info');
                 }
                 
                 // CRITICAL: Create a fresh DAP instance for flashing
