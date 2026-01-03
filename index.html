@@ -266,6 +266,48 @@
 
     <script type="text/javascript" src="lib/dap.umd.js"></script>
     <script>
+        // =============================================================================
+        // Seeed XIAO nRF54L15 Factory Reset Tool
+        // =============================================================================
+        //
+        // This tool implements two operations via CMSIS-DAP:
+        //   1. Recover Only: Mass erase using CTRL-AP (Access Port #2)
+        //   2. Factory Reset: Mass erase + firmware flashing
+        //
+        // Key Technical Findings (from debugging):
+        // -----------------------------------------
+        //
+        // 1. DAP.js Response Parsing Bug:
+        //    DAP.js's transfer() and transferBlock() functions try to read data from
+        //    responses at fixed offsets even for WRITE operations. The Seeed XIAO
+        //    CMSIS-DAP probe returns only 3 bytes (cmd + count + ack) for writes,
+        //    causing "Offset is outside the bounds of the DataView" errors.
+        //    Solution: Use rawDapTransferWrite() to build raw DAP_TRANSFER packets
+        //    and only parse the 3-byte header for write operations.
+        //
+        // 2. nRF54L15 Flash Architecture (RRAMC):
+        //    Unlike nRF52 series which uses NVMC (Non-Volatile Memory Controller),
+        //    the nRF54L15 uses RRAMC (Resistive RAM Controller). Direct MEM-AP writes
+        //    to flash will FAULT unless RRAMC is configured to enable writes.
+        //    Solution: Write 0x101 to RRAMC CONFIG (0x5004B500) before flash writes.
+        //    Reference: OpenOCD nrf54l-load procedure in platform-seeedboards.
+        //
+        // 3. ERASEPROTECTSTATUS Interpretation:
+        //    The ERASEPROTECTSTATUS register value semantics are not fully documented
+        //    for nRF54L15. A value of 0 does not necessarily mean the device is locked.
+        //    This is treated as informational only, not a hard gate for flashing.
+        //
+        // 4. DP.SELECT Cache Issue:
+        //    DAP.js caches the selectedAddress for DP.SELECT. After CTRL-AP operations,
+        //    a fresh DAP instance is needed to ensure MEM-AP (AP #0) is properly selected.
+        //
+        // Reference Files:
+        //   - platform-seeedboards/builder/board_build/nrf/nrf54l.cfg (OpenOCD config)
+        //   - platform-seeedboards/zephyr/boards/arm/xiao_nrf54l15/support/openocd.cfg
+        //   - platform-seeedboards/misc/svd/nrf54l15.svd (RRAMC register definitions)
+        //
+        // =============================================================================
+
         // nRF54L15 CTRL-AP constants (from nrf54l.cfg)
         const CTRL_AP_NUM = 2;
         const CTRL_AP_IDR = 0x32880000;
@@ -1118,49 +1160,68 @@
             
             log('Firmware write completed, verifying...', 'info');
             
-            // Verify firmware by reading back and comparing
-            // For reads, we can use the standard DAP.js API since reads return data
+            // Verify entire firmware by reading back and comparing
+            // For reads, we can use the standard DAP.js API since reads return data correctly
+            // (The DAP.js bug only affects WRITE response parsing, not READ)
             updateProgress(95, 'Verifying firmware...');
-            log('Verifying firmware (reading back and comparing)...', 'info');
+            log('Verifying firmware (reading back entire image)...', 'info');
             
-            // Verify first 56 bytes (vector table area - critical)
-            // Limited by max block read size
-            const verifySize = Math.min(56, firmwareData.length);
-            const verifyWords = verifySize / 4;
+            // Verify entire firmware (padded to word boundary)
+            const verifySize = firmwareData.length;
+            const verifyWords = Math.ceil(verifySize / 4);
             
             try {
-                // Use standard DAP.js readMem32 for verification (reads work correctly)
-                const readBack = [];
-                for (let i = 0; i < verifyWords; i++) {
-                    const addr = startAddress + (i * 4);
-                    const value = await dap.readMem32(addr);
-                    readBack.push(value);
-                }
-                
-                // Convert to bytes for comparison
-                const readBytes = new Uint8Array(verifyWords * 4);
-                const readView = new DataView(readBytes.buffer);
-                for (let i = 0; i < verifyWords; i++) {
-                    readView.setUint32(i * 4, readBack[i], true);
-                }
-                
+                // Use standard DAP.js readMem32 for verification
+                // Read word by word with progress updates
                 let mismatchCount = 0;
-                for (let i = 0; i < verifySize; i++) {
-                    if (readBytes[i] !== firmwareData[i]) {
-                        mismatchCount++;
-                        if (mismatchCount <= 5) {
-                            log(`Verify mismatch at 0x${(startAddress + i).toString(16)}: expected 0x${firmwareData[i].toString(16)}, got 0x${readBytes[i].toString(16)}`, 'warning');
+                let bytesVerified = 0;
+                
+                for (let wordIdx = 0; wordIdx < verifyWords; wordIdx++) {
+                    const addr = startAddress + (wordIdx * 4);
+                    const actualWord = await dap.readMem32(addr);
+                    
+                    // Compare each byte in the word (up to firmware size)
+                    for (let byteOffset = 0; byteOffset < 4; byteOffset++) {
+                        const byteIdx = (wordIdx * 4) + byteOffset;
+                        if (byteIdx >= verifySize) break;
+                        
+                        const actualByte = (actualWord >> (8 * byteOffset)) & 0xFF;
+                        const expectedByte = firmwareData[byteIdx];
+                        
+                        if (actualByte !== expectedByte) {
+                            mismatchCount++;
+                            if (mismatchCount <= 5) {
+                                log(`Verify mismatch at 0x${(startAddress + byteIdx).toString(16)}: expected 0x${expectedByte.toString(16).padStart(2, '0')}, got 0x${actualByte.toString(16).padStart(2, '0')}`, 'warning');
+                            }
                         }
+                    }
+                    
+                    bytesVerified = Math.min((wordIdx + 1) * 4, verifySize);
+                    
+                    // Update progress every 1KB (256 words)
+                    if (wordIdx % 256 === 0 || wordIdx === verifyWords - 1) {
+                        const verifyProgress = 95 + (bytesVerified / verifySize) * 4;
+                        updateProgress(verifyProgress, `Verifying: ${Math.round(bytesVerified / verifySize * 100)}%`);
+                    }
+                    
+                    // Log progress every 4KB (1024 words)
+                    if (wordIdx % 1024 === 0 && wordIdx > 0) {
+                        log(`Verified ${bytesVerified} / ${verifySize} bytes`, 'info');
+                    }
+                    
+                    // Yield to UI every 256 words to prevent freezing
+                    if (wordIdx % 256 === 0) {
+                        await new Promise(r => setTimeout(r, 0));
                     }
                 }
                 
                 if (mismatchCount > 0) {
-                    log(`Verification failed: ${mismatchCount} byte mismatches in first ${verifySize} bytes`, 'error');
+                    log(`Verification failed: ${mismatchCount} byte mismatches in ${verifySize} bytes`, 'error');
                     log('WARNING: Firmware may not have been programmed correctly!', 'error');
-                    log('The device may require NVMC operations for proper flash programming.', 'warning');
+                    log('Check RRAMC configuration or try power cycling the device.', 'warning');
                     throw new Error(`Firmware verification failed: ${mismatchCount} mismatches`);
                 } else {
-                    log(`Verification passed: first ${verifySize} bytes match`, 'success');
+                    log(`Verification passed: all ${verifySize} bytes match`, 'success');
                 }
             } catch (verifyError) {
                 if (verifyError.message.includes('verification failed')) {
@@ -1218,6 +1279,10 @@
                 
                 // Perform mass erase
                 const dap = await performMassErase(transport);
+                
+                // Reset device after erase
+                log('Resetting device...', 'info');
+                await dap.reset();
                 
                 // Disconnect
                 log('Disconnecting...', 'info');
