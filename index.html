@@ -937,7 +937,8 @@
         // of the DataView" errors.
         //
         // Solution: Use raw DAP_TRANSFER packets via transport.write()/read() and only parse
-        // the 3-byte header for write operations.
+        // the 3-byte header for write operations. Use single-operation transfers for maximum
+        // compatibility with all CMSIS-DAP implementations.
         async function flashFirmware(dap, firmwareData, startAddress) {
             log(`Flashing ${firmwareData.length} bytes starting at 0x${startAddress.toString(16)}...`, 'info');
             
@@ -949,13 +950,6 @@
                 throw new Error('Could not find transport object in proxy');
             }
             
-            // Calculate max operations per DAP_TRANSFER packet
-            // DAP_TRANSFER packet: 3 bytes header + 5 bytes per operation
-            // For 64-byte packets: (64 - 3) / 5 = 12 operations max
-            const packetSize = 64;  // Standard CMSIS-DAP packet size
-            const maxOpsPerPacket = Math.floor((packetSize - 3) / 5);
-            log(`Max operations per DAP_TRANSFER packet: ${maxOpsPerPacket}`, 'info');
-            
             // Convert firmware data to 32-bit words (pad with 0xFF if needed)
             const paddedSize = Math.ceil(firmwareData.length / 4) * 4;
             const paddedData = new Uint8Array(paddedSize);
@@ -966,7 +960,7 @@
             const words = new Uint32Array(paddedData.buffer);
             const totalWords = words.length;
             
-            log(`Writing ${totalWords} words using raw DAP_TRANSFER...`, 'info');
+            log(`Writing ${totalWords} words using raw DAP_TRANSFER (single-op mode)...`, 'info');
             
             // MEM-AP register offsets (only A[3:2] bits used in transfer)
             const AP_CSW = 0x00;  // Control/Status Word
@@ -995,53 +989,45 @@
                 value: CSW_VALUE
             }]);
             
-            // Write firmware word by word, batching multiple DRW writes per packet
-            // We need to set TAR before each batch, then write multiple words to DRW
-            // (TAR auto-increments by 4 after each DRW write due to CSW settings)
+            // Write firmware word by word using single-operation transfers
+            // This is slower but guarantees compatibility with all CMSIS-DAP implementations
+            // TAR auto-increments by 4 after each DRW write due to CSW settings
             let wordsWritten = 0;
+            let currentTarAddress = -1;  // Track current TAR to avoid redundant writes
             
             while (wordsWritten < totalWords) {
                 const currentAddress = startAddress + (wordsWritten * 4);
                 
-                // Calculate words until next 1KB boundary (TAR auto-increment wraps at 1KB)
-                const bytesToBoundary = 0x400 - (currentAddress & 0x3FF);
-                const wordsToBoundary = bytesToBoundary / 4;
-                
-                // Chunk size is minimum of: remaining words, words to boundary, max ops - 1 (for TAR write)
-                const remainingWords = totalWords - wordsWritten;
-                const maxDataOps = maxOpsPerPacket - 1;  // Reserve 1 op for TAR write
-                const chunkWords = Math.min(remainingWords, wordsToBoundary, maxDataOps);
+                // Check if we need to update TAR (first write or 1KB boundary crossed)
+                const needTarUpdate = (currentTarAddress === -1) || 
+                                      ((currentAddress & 0x3FF) === 0);  // 1KB boundary
                 
                 try {
-                    // Build operations: TAR write + multiple DRW writes
-                    const operations = [];
-                    
-                    // First operation: write TAR with chunk start address
-                    operations.push({
-                        port: DAP_PORT_ACCESS,
-                        mode: DAP_TRANSFER_WRITE,
-                        register: AP_TAR,
-                        value: currentAddress
-                    });
-                    
-                    // Subsequent operations: write data words to DRW
-                    for (let i = 0; i < chunkWords; i++) {
-                        operations.push({
+                    if (needTarUpdate) {
+                        // Write TAR with current address
+                        await rawDapTransferWrite(transport, [{
                             port: DAP_PORT_ACCESS,
                             mode: DAP_TRANSFER_WRITE,
-                            register: AP_DRW,
-                            value: words[wordsWritten + i]
-                        });
+                            register: AP_TAR,
+                            value: currentAddress
+                        }]);
+                        currentTarAddress = currentAddress;
                     }
                     
-                    // Execute all operations in one packet
-                    await rawDapTransferWrite(transport, operations);
+                    // Write data word to DRW (TAR auto-increments after this)
+                    await rawDapTransferWrite(transport, [{
+                        port: DAP_PORT_ACCESS,
+                        mode: DAP_TRANSFER_WRITE,
+                        register: AP_DRW,
+                        value: words[wordsWritten]
+                    }]);
+                    currentTarAddress += 4;
                 } catch (error) {
-                    log(`Error writing chunk at 0x${currentAddress.toString(16)}: ${error.message}`, 'error');
+                    log(`Error writing word at 0x${currentAddress.toString(16)}: ${error.message}`, 'error');
                     throw error;
                 }
                 
-                wordsWritten += chunkWords;
+                wordsWritten++;
                 
                 // Update progress
                 const bytesWritten = wordsWritten * 4;
