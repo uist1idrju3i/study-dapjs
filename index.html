@@ -342,15 +342,13 @@
             try {
                 const device = await navigator.usb.requestDevice({
                     filters: [
-                        { vendorId: 0xD28 },  // DAPLink vendor ID
-                        { vendorId: 0x1366 }, // SEGGER
-                        { vendorId: 0x0D28 }, // ARM
+                        { vendorId: 0x2886 },  // Seeed Technology Co., Ltd.
                     ]
                 });
                 return device;
             } catch (error) {
                 if (error.name === 'NotFoundError') {
-                    throw new Error('No device selected. Please select a CMSIS-DAP device.');
+                    throw new Error('No device selected. Please select a Seeed CMSIS-DAP device.');
                 }
                 throw error;
             }
@@ -361,18 +359,49 @@
             return (apNum << 24) | regOffset;
         }
         
-        // Read AP register using DAP.js ADI
-        async function readAPReg(dap, apNum, regOffset) {
-            // Select the AP and read the register
+        // Read AP register using DAP.js ADI with retry logic
+        async function readAPReg(dap, apNum, regOffset, retries = 3) {
             // The AP address format: bits [31:24] = AP number, bits [7:4] = register bank, bits [3:0] = register offset
             const addr = apRegAddr(apNum, regOffset);
-            return await dap.readAP(addr);
+            
+            for (let attempt = 0; attempt < retries; attempt++) {
+                try {
+                    const result = await dap.readAP(addr);
+                    if (result !== undefined) {
+                        return result;
+                    }
+                    // Result is undefined, retry after a short delay
+                    log(`AP read returned undefined (attempt ${attempt + 1}/${retries}), retrying...`, 'warning');
+                    await sleep(50);
+                } catch (error) {
+                    if (attempt < retries - 1) {
+                        log(`AP read error (attempt ${attempt + 1}/${retries}): ${error.message}, retrying...`, 'warning');
+                        await sleep(50);
+                    } else {
+                        throw error;
+                    }
+                }
+            }
+            return undefined;
         }
         
-        // Write AP register using DAP.js ADI
-        async function writeAPReg(dap, apNum, regOffset, value) {
+        // Write AP register using DAP.js ADI with retry logic
+        async function writeAPReg(dap, apNum, regOffset, value, retries = 3) {
             const addr = apRegAddr(apNum, regOffset);
-            await dap.writeAP(addr, value);
+            
+            for (let attempt = 0; attempt < retries; attempt++) {
+                try {
+                    await dap.writeAP(addr, value);
+                    return;
+                } catch (error) {
+                    if (attempt < retries - 1) {
+                        log(`AP write error (attempt ${attempt + 1}/${retries}): ${error.message}, retrying...`, 'warning');
+                        await sleep(50);
+                    } else {
+                        throw error;
+                    }
+                }
+            }
         }
         
         // Perform nRF54L15 mass erase using CTRL-AP
@@ -390,11 +419,18 @@
                 // Read CTRL-AP IDR to verify we can access it
                 log('Verifying CTRL-AP access (AP #2)...', 'info');
                 const idr = await readAPReg(dap, CTRL_AP_NUM, CTRL_AP_IDR_REG);
-                log(`CTRL-AP IDR: 0x${idr.toString(16).toUpperCase()}`, 'info');
                 
-                if (idr !== CTRL_AP_IDR) {
-                    log(`Warning: Unexpected CTRL-AP IDR (expected 0x${CTRL_AP_IDR.toString(16).toUpperCase()})`, 'warning');
-                    log('Proceeding with mass erase anyway...', 'warning');
+                if (idr === undefined) {
+                    log('Warning: Could not read CTRL-AP IDR (returned undefined)', 'warning');
+                    log('This may indicate the device is locked or CTRL-AP is not accessible.', 'warning');
+                    log('Attempting mass erase anyway...', 'warning');
+                } else {
+                    log(`CTRL-AP IDR: 0x${idr.toString(16).toUpperCase()}`, 'info');
+                    
+                    if (idr !== CTRL_AP_IDR) {
+                        log(`Warning: Unexpected CTRL-AP IDR (expected 0x${CTRL_AP_IDR.toString(16).toUpperCase()})`, 'warning');
+                        log('Proceeding with mass erase anyway...', 'warning');
+                    }
                 }
                 
                 // Reset ERASEALL task first
@@ -414,6 +450,13 @@
                 for (let i = 0; i < timeout; i++) {
                     status = await readAPReg(dap, CTRL_AP_NUM, CTRL_AP_ERASEALLSTATUS);
                     
+                    if (status === undefined) {
+                        // Status read failed, continue polling
+                        await sleep(100);
+                        updateProgress((i / timeout) * 30, 'Starting erase...');
+                        continue;
+                    }
+                    
                     if (status === ERASEALLSTATUS_BUSY) {
                         log('Erase in progress (BUSY)...', 'info');
                         break;
@@ -432,8 +475,8 @@
                     updateProgress((i / timeout) * 30, 'Starting erase...');
                 }
                 
-                if (status !== ERASEALLSTATUS_BUSY && status !== ERASEALLSTATUS_READYTORESET) {
-                    throw new Error('Timeout waiting for erase to start');
+                if (status === undefined || (status !== ERASEALLSTATUS_BUSY && status !== ERASEALLSTATUS_READYTORESET)) {
+                    throw new Error('Timeout waiting for erase to start or unable to read status');
                 }
                 
                 // Wait for READYTORESET state
@@ -442,6 +485,13 @@
                     
                     for (let i = 0; i < timeout; i++) {
                         status = await readAPReg(dap, CTRL_AP_NUM, CTRL_AP_ERASEALLSTATUS);
+                        
+                        if (status === undefined) {
+                            // Status read failed, continue polling
+                            await sleep(100);
+                            updateProgress(30 + (i / timeout) * 50, 'Erasing...');
+                            continue;
+                        }
                         
                         if (status === ERASEALLSTATUS_READYTORESET) {
                             log('Erase completed successfully (READYTORESET)', 'success');
@@ -456,8 +506,8 @@
                         updateProgress(30 + (i / timeout) * 50, 'Erasing...');
                     }
                     
-                    if (status !== ERASEALLSTATUS_READYTORESET) {
-                        throw new Error('Timeout waiting for erase to complete');
+                    if (status === undefined || status !== ERASEALLSTATUS_READYTORESET) {
+                        throw new Error('Timeout waiting for erase to complete or unable to read status');
                     }
                 }
                 
