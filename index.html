@@ -499,7 +499,99 @@
             }
         }
         
+        // Internal function to attempt ERASEALL operation
+        // Returns true if successful, false if failed (for fallback retry)
+        async function attemptEraseAll(dap, isRetry = false) {
+            const retryPrefix = isRetry ? '[Retry] ' : '';
+            
+            // Reset ERASEALL task first
+            log(`${retryPrefix}Resetting ERASEALL task...`, 'info');
+            await writeAPReg(dap, CTRL_AP_NUM, CTRL_AP_ERASEALL, 0);
+            await sleep(10);
+            
+            // Trigger ERASEALL task
+            log(`${retryPrefix}Triggering mass erase (ERASEALL)...`, 'info');
+            await writeAPReg(dap, CTRL_AP_NUM, CTRL_AP_ERASEALL, 1);
+            
+            // Wait for BUSY state
+            log(`${retryPrefix}Waiting for erase to start...`, 'info');
+            const timeout = 300; // ~30 seconds
+            let status;
+            
+            for (let i = 0; i < timeout; i++) {
+                status = await readAPReg(dap, CTRL_AP_NUM, CTRL_AP_ERASEALLSTATUS);
+                
+                if (status === undefined) {
+                    // Status read failed, continue polling
+                    await sleep(100);
+                    updateProgress((i / timeout) * 30, 'Starting erase...');
+                    continue;
+                }
+                
+                if (status === ERASEALLSTATUS_BUSY) {
+                    log(`${retryPrefix}Erase in progress (BUSY)...`, 'info');
+                    break;
+                }
+                
+                if (status === ERASEALLSTATUS_ERROR) {
+                    log(`${retryPrefix}Erase failed with ERROR status`, 'error');
+                    return false;
+                }
+                
+                if (status === ERASEALLSTATUS_READYTORESET) {
+                    log(`${retryPrefix}Device already erased (READYTORESET)`, 'success');
+                    return true;
+                }
+                
+                await sleep(100);
+                updateProgress((i / timeout) * 30, 'Starting erase...');
+            }
+            
+            if (status === undefined || (status !== ERASEALLSTATUS_BUSY && status !== ERASEALLSTATUS_READYTORESET)) {
+                log(`${retryPrefix}Timeout waiting for erase to start or unable to read status`, 'error');
+                return false;
+            }
+            
+            // Wait for READYTORESET state
+            if (status === ERASEALLSTATUS_BUSY) {
+                log(`${retryPrefix}Waiting for erase to complete...`, 'info');
+                
+                for (let i = 0; i < timeout; i++) {
+                    status = await readAPReg(dap, CTRL_AP_NUM, CTRL_AP_ERASEALLSTATUS);
+                    
+                    if (status === undefined) {
+                        // Status read failed, continue polling
+                        await sleep(100);
+                        updateProgress(30 + (i / timeout) * 50, 'Erasing...');
+                        continue;
+                    }
+                    
+                    if (status === ERASEALLSTATUS_READYTORESET) {
+                        log(`${retryPrefix}Erase completed successfully (READYTORESET)`, 'success');
+                        return true;
+                    }
+                    
+                    if (status === ERASEALLSTATUS_ERROR) {
+                        log(`${retryPrefix}Erase failed with ERROR status`, 'error');
+                        return false;
+                    }
+                    
+                    await sleep(100);
+                    updateProgress(30 + (i / timeout) * 50, 'Erasing...');
+                }
+                
+                if (status === undefined || status !== ERASEALLSTATUS_READYTORESET) {
+                    log(`${retryPrefix}Timeout waiting for erase to complete or unable to read status`, 'error');
+                    return false;
+                }
+            }
+            
+            return true;
+        }
+        
         // Perform nRF54L15 mass erase using CTRL-AP
+        // Implements fallback to standard erase (reconnect + retry) if mass erase fails,
+        // similar to pyocd's behavior in reset_tool.py
         async function performMassErase(transport) {
             log('Initializing DAP connection...', 'info');
             
@@ -528,81 +620,36 @@
                     }
                 }
                 
-                // Reset ERASEALL task first
-                log('Resetting ERASEALL task...', 'info');
-                await writeAPReg(dap, CTRL_AP_NUM, CTRL_AP_ERASEALL, 0);
-                await sleep(10);
+                // Attempt mass erase
+                let eraseSuccess = await attemptEraseAll(dap, false);
                 
-                // Trigger ERASEALL task
-                log('Triggering mass erase (ERASEALL)...', 'info');
-                await writeAPReg(dap, CTRL_AP_NUM, CTRL_AP_ERASEALL, 1);
-                
-                // Wait for BUSY state
-                log('Waiting for erase to start...', 'info');
-                let timeout = 300; // ~30 seconds
-                let status;
-                
-                for (let i = 0; i < timeout; i++) {
-                    status = await readAPReg(dap, CTRL_AP_NUM, CTRL_AP_ERASEALLSTATUS);
+                // If mass erase failed, try standard erase fallback (reconnect + retry)
+                // This mirrors pyocd's behavior: try mass erase first, then standard erase
+                if (!eraseSuccess) {
+                    log('Mass erase failed, attempting standard erase fallback...', 'warning');
+                    log('Reconnecting to device...', 'info');
                     
-                    if (status === undefined) {
-                        // Status read failed, continue polling
-                        await sleep(100);
-                        updateProgress((i / timeout) * 30, 'Starting erase...');
-                        continue;
-                    }
-                    
-                    if (status === ERASEALLSTATUS_BUSY) {
-                        log('Erase in progress (BUSY)...', 'info');
-                        break;
-                    }
-                    
-                    if (status === ERASEALLSTATUS_ERROR) {
-                        throw new Error('Erase failed with ERROR status');
-                    }
-                    
-                    if (status === ERASEALLSTATUS_READYTORESET) {
-                        log('Device already erased (READYTORESET)', 'success');
-                        break;
-                    }
-                    
-                    await sleep(100);
-                    updateProgress((i / timeout) * 30, 'Starting erase...');
-                }
-                
-                if (status === undefined || (status !== ERASEALLSTATUS_BUSY && status !== ERASEALLSTATUS_READYTORESET)) {
-                    throw new Error('Timeout waiting for erase to start or unable to read status');
-                }
-                
-                // Wait for READYTORESET state
-                if (status === ERASEALLSTATUS_BUSY) {
-                    log('Waiting for erase to complete...', 'info');
-                    
-                    for (let i = 0; i < timeout; i++) {
-                        status = await readAPReg(dap, CTRL_AP_NUM, CTRL_AP_ERASEALLSTATUS);
+                    try {
+                        // Disconnect and reconnect to reset the debug session
+                        await dap.disconnect();
+                        await sleep(500);
+                        await dap.connect();
+                        log('Reconnected for standard erase', 'success');
                         
-                        if (status === undefined) {
-                            // Status read failed, continue polling
-                            await sleep(100);
-                            updateProgress(30 + (i / timeout) * 50, 'Erasing...');
-                            continue;
+                        // Wait for device to stabilize
+                        await sleep(200);
+                        
+                        // Retry the erase operation
+                        eraseSuccess = await attemptEraseAll(dap, true);
+                        
+                        if (!eraseSuccess) {
+                            throw new Error('Both mass erase and standard erase fallback failed');
                         }
                         
-                        if (status === ERASEALLSTATUS_READYTORESET) {
-                            log('Erase completed successfully (READYTORESET)', 'success');
-                            break;
-                        }
-                        
-                        if (status === ERASEALLSTATUS_ERROR) {
-                            throw new Error('Erase failed with ERROR status');
-                        }
-                        
-                        await sleep(100);
-                        updateProgress(30 + (i / timeout) * 50, 'Erasing...');
-                    }
-                    
-                    if (status === undefined || status !== ERASEALLSTATUS_READYTORESET) {
-                        throw new Error('Timeout waiting for erase to complete or unable to read status');
+                        log('Standard erase fallback succeeded', 'success');
+                    } catch (fallbackError) {
+                        log(`Standard erase fallback error: ${fallbackError.message}`, 'error');
+                        throw new Error('Erase failed: both mass erase and standard erase fallback failed');
                     }
                 }
                 
@@ -783,11 +830,35 @@
             };
         }
         
-        // Flash firmware to device using DAP.js writeBlock API
-        // This uses transferBlock internally which properly handles writes
-        // without the DataView bug that affects transfer() with mixed operations
+        // Get the underlying CmsisDAP proxy from an ADI instance
+        // This is needed to access transferBlock directly and bypass the buggy transfer() function
+        function getProxy(dap) {
+            const propNames = Object.getOwnPropertyNames(dap);
+            for (const name of propNames) {
+                const prop = dap[name];
+                if (prop && typeof prop === 'object' && typeof prop.transferBlock === 'function') {
+                    return prop;
+                }
+            }
+            throw new Error('Could not find proxy object with transferBlock in ADI instance');
+        }
+        
+        // Flash firmware to device using direct transferBlock API
+        // This bypasses the buggy ADI.writeBlock() which internally uses transfer() with
+        // multiple operations, causing "Offset is outside the bounds of DataView" errors.
+        // 
+        // The bug: DAP.js transfer([ops]) always tries to read ops.length * 4 bytes from
+        // the response, even for WRITE operations which don't return data words.
+        // ADI.writeBlock() calls transferSequence() which batches CSW+TAR writes together,
+        // triggering this bug.
+        //
+        // Solution: Use single-operation transfer() calls for setup (which work correctly),
+        // then use transferBlock() directly for the bulk data writes (which is safe for writes).
         async function flashFirmware(dap, firmwareData, startAddress) {
             log(`Flashing ${firmwareData.length} bytes starting at 0x${startAddress.toString(16)}...`, 'info');
+            
+            // Get the underlying proxy for direct transferBlock access
+            const proxy = getProxy(dap);
             
             // Convert firmware data to 32-bit words (pad with 0xFF if needed)
             const paddedSize = Math.ceil(firmwareData.length / 4) * 4;
@@ -795,27 +866,71 @@
             paddedData.fill(0xFF); // Fill with 0xFF (erased flash value)
             paddedData.set(firmwareData);
             
-            // Convert to Uint32Array for writeBlock
+            // Convert to Uint32Array for block writes
             const words = new Uint32Array(paddedData.buffer);
             const totalWords = words.length;
             
-            log(`Writing ${totalWords} words using writeBlock...`, 'info');
+            log(`Writing ${totalWords} words using direct transferBlock...`, 'info');
             
-            // Write in chunks to show progress and avoid timeout
-            // writeBlock handles TAR auto-increment boundaries internally
-            const CHUNK_SIZE = 256; // words per chunk (1KB)
+            // MEM-AP register offsets (only A[3:2] bits used in transfer)
+            const AP_CSW = 0x00;  // Control/Status Word
+            const AP_TAR = 0x04;  // Transfer Address Register
+            const AP_DRW = 0x0C;  // Data Read/Write
+            
+            // CSW value for 32-bit access with auto-increment single
+            // CSWMask.VALUE | CSWMask.SIZE_32 = 0x23000052
+            // VALUE = ADDRINC_SINGLE(0x10) | DBGSTATUS(0x40) | RESERVED(0x01000000) | HPROT1(0x02000000) | MASTERTYPE(0x20000000)
+            // SIZE_32 = 0x02
+            const CSW_VALUE = 0x23000052;
+            
+            // Select MEM-AP (AP #0) bank 0 for CSW/TAR/DRW
+            // Use single-operation transfer (which works correctly)
+            await proxy.transfer([{
+                port: DAP_PORT_DEBUG,
+                mode: DAP_TRANSFER_WRITE,
+                register: DP_REG_SELECT,
+                value: 0x00000000  // APSEL=0, APBANKSEL=0
+            }]);
+            
+            // Write CSW for 32-bit access with auto-increment
+            await proxy.transfer([{
+                port: DAP_PORT_ACCESS,
+                mode: DAP_TRANSFER_WRITE,
+                register: AP_CSW,
+                value: CSW_VALUE
+            }]);
+            
+            // Write in chunks, respecting 1KB TAR auto-increment boundary
+            // TAR auto-increment wraps at 1KB (0x400) boundaries
+            const MAX_CHUNK_WORDS = 256; // 1KB max per chunk
             let wordsWritten = 0;
             
             while (wordsWritten < totalWords) {
+                const currentAddress = startAddress + (wordsWritten * 4);
+                
+                // Calculate words until next 1KB boundary
+                const bytesToBoundary = 0x400 - (currentAddress & 0x3FF);
+                const wordsToBoundary = bytesToBoundary / 4;
+                
+                // Chunk size is minimum of: remaining words, words to boundary, max chunk size
                 const remainingWords = totalWords - wordsWritten;
-                const chunkWords = Math.min(CHUNK_SIZE, remainingWords);
+                const chunkWords = Math.min(remainingWords, wordsToBoundary, MAX_CHUNK_WORDS);
                 const chunkData = words.slice(wordsWritten, wordsWritten + chunkWords);
-                const chunkAddress = startAddress + (wordsWritten * 4);
                 
                 try {
-                    await dap.writeBlock(chunkAddress, chunkData);
+                    // Write TAR with chunk start address (single-operation transfer)
+                    await proxy.transfer([{
+                        port: DAP_PORT_ACCESS,
+                        mode: DAP_TRANSFER_WRITE,
+                        register: AP_TAR,
+                        value: currentAddress
+                    }]);
+                    
+                    // Write data block using transferBlock (safe for writes)
+                    // transferBlock uses DAP_TRANSFER_BLOCK command which doesn't have the bug
+                    await proxy.transferBlock(DAP_PORT_ACCESS, AP_DRW, chunkData);
                 } catch (error) {
-                    log(`Error writing chunk at 0x${chunkAddress.toString(16)}: ${error.message}`, 'error');
+                    log(`Error writing chunk at 0x${currentAddress.toString(16)}: ${error.message}`, 'error');
                     throw error;
                 }
                 
@@ -826,8 +941,8 @@
                 const progress = 80 + (bytesWritten / paddedSize) * 15;
                 updateProgress(progress, `Flashing: ${Math.round(bytesWritten / paddedSize * 100)}%`);
                 
-                // Log progress every few chunks
-                if (wordsWritten % (CHUNK_SIZE * 4) === 0 || wordsWritten === totalWords) {
+                // Log progress every 4KB or at the end
+                if (wordsWritten % 1024 === 0 || wordsWritten === totalWords) {
                     const actualBytesWritten = Math.min(bytesWritten, firmwareData.length);
                     log(`Flashed ${actualBytesWritten} / ${firmwareData.length} bytes`, 'info');
                 }
@@ -836,13 +951,25 @@
             log('Firmware write completed, verifying...', 'info');
             
             // Verify firmware by reading back and comparing
+            // Use the same safe approach: single-op transfers for setup, transferBlock for data
             updateProgress(95, 'Verifying firmware...');
             log('Verifying firmware (reading back and comparing)...', 'info');
             
             // Verify first 256 bytes (vector table area - critical)
             const verifySize = Math.min(256, firmwareData.length);
+            const verifyWords = verifySize / 4;
+            
             try {
-                const readBack = await dap.readBlock(startAddress, verifySize / 4);
+                // Set TAR to start address for verification read
+                await proxy.transfer([{
+                    port: DAP_PORT_ACCESS,
+                    mode: DAP_TRANSFER_WRITE,
+                    register: AP_TAR,
+                    value: startAddress
+                }]);
+                
+                // Read data block using transferBlock (safe for reads too)
+                const readBack = await proxy.transferBlock(DAP_PORT_ACCESS, AP_DRW, verifyWords);
                 const readBytes = new Uint8Array(readBack.buffer);
                 
                 let mismatchCount = 0;
