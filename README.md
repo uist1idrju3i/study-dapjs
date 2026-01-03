@@ -2,31 +2,35 @@
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/uist1idrju3i/study-dapjs)
 
-Seeed XIAO nRF54L15向けのブラウザベースのファクトリーリセット・リカバリーツールです。WebUSBとCMSIS-DAPを使用して、インストール不要でブラウザから直接デバイスの復旧やファームウェア書き込みを行えます。
+A browser-based factory reset and recovery tool for Seeed XIAO nRF54L15. Using WebUSB and CMSIS-DAP, you can recover devices and flash firmware directly from your browser without any installation.
 
-## 機能
+## Features
 
-- **Recover Only**: CTRL-AP経由でデバイスのマスイレースを実行し、保護されたデバイスをアンロックします
-- **Factory Reset**: マスイレース後にファクトリーファームウェア（firmware.hex）を書き込み、デバイスを出荷時状態に復元します
-- **OpenBlink XIAO nRF54L15 Firmware Flash**: マスイレース後に[OpenBlinkファームウェア](https://github.com/uist1idrju3i/openblink_XIAO_nRF54L15_Sense)を書き込みます
+- **Recover Only**: Performs a mass erase via CTRL-AP to unlock protected devices
+- **Factory Reset**: Performs a mass erase followed by flashing the factory firmware (firmware.hex) to restore the device to its original state
+- **OpenBlink XIAO nRF54L15 Firmware Flash**: Performs a mass erase followed by flashing the [OpenBlink firmware](https://github.com/uist1idrju3i/openblink_XIAO_nRF54L15_Sense)
 
-## 動作確認環境
+## Verified Environment
 
 - MacBook Pro (Apple M3)
 - macOS 26.2
-- Google Chrome 143.0.7499.170（公式ビルド）（arm64）
+- Google Chrome 143.0.7499.170 (Official Build) (arm64)
 
-## 使い方
+## How to Use
 
-1. `index.html`をChromeまたはEdgeブラウザで開きます
-2. 免責事項に同意します
-3. 実行したい操作のボタンをクリックします
-4. WebUSBデバイスピッカーからSeeed XIAO nRF54L15を選択します
-5. 操作が完了するまで待ちます
+1. Start a local HTTP server in the project directory:
+   ```console
+   $ python3 -m http.server 8000
+   ```
+2. Open `http://localhost:8000/index.html` in Chrome or Edge browser
+3. Accept the disclaimer
+4. Click the button for the operation you want to perform
+5. Select Seeed XIAO nRF54L15 from the WebUSB device picker
+6. Wait for the operation to complete
 
 ## How to Get
 
-リポジトリをクローンしてサブモジュールを初期化するには、以下のコマンドを実行してください：
+To clone the repository and initialize the submodules, run the following commands:
 
 ```console
 $ git clone https://github.com/uist1idrju3i/study-dapjs.git
@@ -34,13 +38,13 @@ $ git submodule init
 $ git submodule update
 ```
 
-## ライセンス
+## License
 
-このプロジェクトはBSD 3-Clause Licenseの下で公開されています。
+This project is licensed under the BSD 3-Clause License.
 
-使用しているライブラリ：
+Libraries used:
 - [DAP.js](https://github.com/ARMmbed/dapjs) - MIT License
-- [platform-seeedboards](https://github.com/Seeed-Studio/platform-seeedboards/) - Apache License 2.0（設定リファレンス）
+- [platform-seeedboards](https://github.com/Seeed-Studio/platform-seeedboards/) - Apache License 2.0 (configuration reference)
 
 ## Recommended VS Code Extensions
 
