@@ -849,16 +849,20 @@
         // 
         // The bug: DAP.js transfer([ops]) always tries to read ops.length * 4 bytes from
         // the response, even for WRITE operations which don't return data words.
-        // ADI.writeBlock() calls transferSequence() which batches CSW+TAR writes together,
-        // triggering this bug.
+        // This affects ALL array-based transfer() calls, even single-element ones.
         //
-        // Solution: Use single-operation transfer() calls for setup (which work correctly),
-        // then use transferBlock() directly for the bulk data writes (which is safe for writes).
+        // Solution: Use transferBlock() for ALL writes (including setup registers).
+        // transferBlock() is safe for writes because it doesn't try to read data from response.
         async function flashFirmware(dap, firmwareData, startAddress) {
             log(`Flashing ${firmwareData.length} bytes starting at 0x${startAddress.toString(16)}...`, 'info');
             
             // Get the underlying proxy for direct transferBlock access
             const proxy = getProxy(dap);
+            
+            // Get the maximum block size from the proxy (based on CMSIS-DAP packet size)
+            // blockSize = packetSize - BLOCK_HEADER_SIZE - 1 (typically 59 bytes for 64-byte packets)
+            const maxBlockWords = Math.floor(proxy.blockSize / 4);
+            log(`CMSIS-DAP block size: ${proxy.blockSize} bytes (${maxBlockWords} words max per transfer)`, 'info');
             
             // Convert firmware data to 32-bit words (pad with 0xFF if needed)
             const paddedSize = Math.ceil(firmwareData.length / 4) * 4;
@@ -884,25 +888,15 @@
             const CSW_VALUE = 0x23000052;
             
             // Select MEM-AP (AP #0) bank 0 for CSW/TAR/DRW
-            // Use single-operation transfer (which works correctly)
-            await proxy.transfer([{
-                port: DAP_PORT_DEBUG,
-                mode: DAP_TRANSFER_WRITE,
-                register: DP_REG_SELECT,
-                value: 0x00000000  // APSEL=0, APBANKSEL=0
-            }]);
+            // Use transferBlock for ALL writes to avoid the buggy transfer() function
+            await proxy.transferBlock(DAP_PORT_DEBUG, DP_REG_SELECT, new Uint32Array([0x00000000]));
             
             // Write CSW for 32-bit access with auto-increment
-            await proxy.transfer([{
-                port: DAP_PORT_ACCESS,
-                mode: DAP_TRANSFER_WRITE,
-                register: AP_CSW,
-                value: CSW_VALUE
-            }]);
+            await proxy.transferBlock(DAP_PORT_ACCESS, AP_CSW, new Uint32Array([CSW_VALUE]));
             
-            // Write in chunks, respecting 1KB TAR auto-increment boundary
-            // TAR auto-increment wraps at 1KB (0x400) boundaries
-            const MAX_CHUNK_WORDS = 256; // 1KB max per chunk
+            // Write in chunks, respecting both:
+            // 1. CMSIS-DAP packet size limit (maxBlockWords)
+            // 2. 1KB TAR auto-increment boundary (0x400)
             let wordsWritten = 0;
             
             while (wordsWritten < totalWords) {
@@ -912,19 +906,14 @@
                 const bytesToBoundary = 0x400 - (currentAddress & 0x3FF);
                 const wordsToBoundary = bytesToBoundary / 4;
                 
-                // Chunk size is minimum of: remaining words, words to boundary, max chunk size
+                // Chunk size is minimum of: remaining words, words to boundary, max block size
                 const remainingWords = totalWords - wordsWritten;
-                const chunkWords = Math.min(remainingWords, wordsToBoundary, MAX_CHUNK_WORDS);
+                const chunkWords = Math.min(remainingWords, wordsToBoundary, maxBlockWords);
                 const chunkData = words.slice(wordsWritten, wordsWritten + chunkWords);
                 
                 try {
-                    // Write TAR with chunk start address (single-operation transfer)
-                    await proxy.transfer([{
-                        port: DAP_PORT_ACCESS,
-                        mode: DAP_TRANSFER_WRITE,
-                        register: AP_TAR,
-                        value: currentAddress
-                    }]);
+                    // Write TAR with chunk start address using transferBlock
+                    await proxy.transferBlock(DAP_PORT_ACCESS, AP_TAR, new Uint32Array([currentAddress]));
                     
                     // Write data block using transferBlock (safe for writes)
                     // transferBlock uses DAP_TRANSFER_BLOCK command which doesn't have the bug
@@ -941,8 +930,8 @@
                 const progress = 80 + (bytesWritten / paddedSize) * 15;
                 updateProgress(progress, `Flashing: ${Math.round(bytesWritten / paddedSize * 100)}%`);
                 
-                // Log progress every 4KB or at the end
-                if (wordsWritten % 1024 === 0 || wordsWritten === totalWords) {
+                // Log progress every 1KB or at the end
+                if (wordsWritten % 256 === 0 || wordsWritten === totalWords) {
                     const actualBytesWritten = Math.min(bytesWritten, firmwareData.length);
                     log(`Flashed ${actualBytesWritten} / ${firmwareData.length} bytes`, 'info');
                 }
@@ -951,29 +940,26 @@
             log('Firmware write completed, verifying...', 'info');
             
             // Verify firmware by reading back and comparing
-            // Use the same safe approach: single-op transfers for setup, transferBlock for data
+            // Use transferBlock for reads too, respecting the block size limit
             updateProgress(95, 'Verifying firmware...');
             log('Verifying firmware (reading back and comparing)...', 'info');
             
             // Verify first 256 bytes (vector table area - critical)
+            // But limit to maxBlockWords to avoid exceeding packet size
             const verifySize = Math.min(256, firmwareData.length);
-            const verifyWords = verifySize / 4;
+            const verifyWords = Math.min(verifySize / 4, maxBlockWords);
+            const actualVerifySize = verifyWords * 4;
             
             try {
-                // Set TAR to start address for verification read
-                await proxy.transfer([{
-                    port: DAP_PORT_ACCESS,
-                    mode: DAP_TRANSFER_WRITE,
-                    register: AP_TAR,
-                    value: startAddress
-                }]);
+                // Set TAR to start address for verification read using transferBlock
+                await proxy.transferBlock(DAP_PORT_ACCESS, AP_TAR, new Uint32Array([startAddress]));
                 
                 // Read data block using transferBlock (safe for reads too)
                 const readBack = await proxy.transferBlock(DAP_PORT_ACCESS, AP_DRW, verifyWords);
                 const readBytes = new Uint8Array(readBack.buffer);
                 
                 let mismatchCount = 0;
-                for (let i = 0; i < verifySize; i++) {
+                for (let i = 0; i < actualVerifySize; i++) {
                     if (readBytes[i] !== firmwareData[i]) {
                         mismatchCount++;
                         if (mismatchCount <= 5) {
@@ -983,12 +969,12 @@
                 }
                 
                 if (mismatchCount > 0) {
-                    log(`Verification failed: ${mismatchCount} byte mismatches in first ${verifySize} bytes`, 'error');
+                    log(`Verification failed: ${mismatchCount} byte mismatches in first ${actualVerifySize} bytes`, 'error');
                     log('WARNING: Firmware may not have been programmed correctly!', 'error');
                     log('The device may require NVMC operations for proper flash programming.', 'warning');
                     throw new Error(`Firmware verification failed: ${mismatchCount} mismatches`);
                 } else {
-                    log(`Verification passed: first ${verifySize} bytes match`, 'success');
+                    log(`Verification passed: first ${actualVerifySize} bytes match`, 'success');
                 }
             } catch (verifyError) {
                 if (verifyError.message.includes('verification failed')) {
