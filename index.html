@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Seeed XIAO nRF54L15 Factory Reset Tool</title>
+    <title>Seeed XIAO nRF54L15 Factory Reset Tool (Unofficial)</title>
     <style>
         * {
             box-sizing: border-box;
@@ -206,11 +206,100 @@
         footer a:hover {
             text-decoration: underline;
         }
+        
+        /* Disclaimer Modal */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.8);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+        
+        .modal-overlay.hidden {
+            display: none;
+        }
+        
+        .modal-content {
+            background-color: #16213e;
+            border-radius: 12px;
+            padding: 30px;
+            max-width: 600px;
+            width: 90%;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+        }
+        
+        .modal-content h2 {
+            color: #e94560;
+            margin-top: 0;
+            font-size: 22px;
+            text-align: center;
+        }
+        
+        .modal-content p {
+            color: #eaeaea;
+            font-size: 14px;
+            line-height: 1.8;
+            margin-bottom: 15px;
+        }
+        
+        .modal-content ul {
+            color: #aaa;
+            font-size: 13px;
+            line-height: 1.8;
+            margin-bottom: 20px;
+            padding-left: 20px;
+        }
+        
+        .modal-content .btn-agree {
+            display: block;
+            width: 100%;
+            padding: 14px 28px;
+            font-size: 16px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            background-color: #e94560;
+            color: white;
+            font-weight: 500;
+            transition: all 0.2s ease;
+        }
+        
+        .modal-content .btn-agree:hover {
+            background-color: #ff6b6b;
+        }
+        
+        .main-content.disabled {
+            pointer-events: none;
+            opacity: 0.3;
+        }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>Seeed XIAO nRF54L15 Factory Reset Tool</h1>
+    <!-- Disclaimer Modal -->
+    <div class="modal-overlay" id="disclaimerModal">
+        <div class="modal-content">
+            <h2>Disclaimer / At Your Own Risk</h2>
+            <p>This is an <strong>unofficial tool</strong> and is not affiliated with, endorsed by, or supported by Seeed Studio or Nordic Semiconductor.</p>
+            <p>By using this tool, you acknowledge and agree to the following:</p>
+            <ul>
+                <li>This tool is provided "AS IS" without warranty of any kind.</li>
+                <li>Use of this tool is entirely at your own risk.</li>
+                <li>The author(s) are not responsible for any damage to your device, data loss, or any other issues that may arise from using this tool.</li>
+                <li>This tool performs low-level operations (mass erase, firmware flashing) that can permanently alter your device.</li>
+                <li>Always ensure you have backups of important data before proceeding.</li>
+            </ul>
+            <button class="btn-agree" onclick="acceptDisclaimer()">I Understand and Accept the Risk</button>
+        </div>
+    </div>
+    
+    <div class="container main-content disabled" id="mainContent">
+        <h1>Seeed XIAO nRF54L15 Factory Reset Tool (Unofficial)</h1>
         <p class="subtitle">WebUSB-based device recovery and factory reset using CMSIS-DAP</p>
         
         <div class="card">
@@ -257,6 +346,11 @@
     <footer>
         <p>Powered by <a href="https://github.com/ARMmbed/dapjs" target="_blank">DAP.js</a> | 
         Target: Seeed XIAO nRF54L15</p>
+        <p style="margin-top: 15px;">
+            <a href="https://github.com/uist1idrju3i/study-dapjs" target="_blank">Source Code on GitHub</a>
+            &nbsp;|&nbsp;
+            <a href="https://deepwiki.com/uist1idrju3i/study-dapjs" target="_blank"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" style="vertical-align: middle;"></a>
+        </p>
         <p style="margin-top: 15px; font-size: 11px; color: #555;">
             <strong>Licenses:</strong><br>
             DAP.js - <a href="lib/dapjs-LICENSE.txt" target="_blank">MIT License</a>, Copyright (c) Arm Limited 2018, Microsoft Corporation<br>
@@ -1519,6 +1613,12 @@
                 setButtonsEnabled(true);
                 showProgress(false);
             }
+        }
+        
+        // Disclaimer acceptance function
+        function acceptDisclaimer() {
+            document.getElementById('disclaimerModal').classList.add('hidden');
+            document.getElementById('mainContent').classList.remove('disabled');
         }
         
         // Check WebUSB support on page load
