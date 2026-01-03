@@ -783,6 +783,58 @@
             };
         }
         
+        // Custom memory write function that works around DAP.js transfer() bug
+        // The bug: DAP.js transfer() with array of operations always tries to read
+        // operations.length * 4 bytes from response, even for WRITE operations which
+        // don't return data words. This causes "Offset is outside the bounds of DataView".
+        // Workaround: Add a harmless DP READ (DPIDR) to each batch of writes so the
+        // response contains at least one data word.
+        async function safeWriteMem32(dap, address, value) {
+            // Access the underlying proxy (CmsisDAP) for low-level transfers
+            let proxy = null;
+            const propNames = Object.getOwnPropertyNames(dap);
+            for (const name of propNames) {
+                const prop = dap[name];
+                if (prop && typeof prop === 'object' && typeof prop.transfer === 'function') {
+                    proxy = prop;
+                    break;
+                }
+            }
+            
+            if (!proxy) {
+                throw new Error('Could not find proxy object in ADI instance');
+            }
+            
+            // MEM-AP registers (AP #0)
+            const AP_CSW = 0x00;  // Control/Status Word
+            const AP_TAR = 0x04;  // Transfer Address Register
+            const AP_DRW = 0x0C;  // Data Read/Write
+            const DP_DPIDR = 0x00; // DP Identification Register (for dummy read)
+            
+            // CSW value for 32-bit access with auto-increment disabled
+            const CSW_VALUE = 0x23000052; // SIZE=32bit, AddrInc=OFF, DbgSwEnable, Prot
+            
+            // Select MEM-AP (AP #0) bank 0 for CSW/TAR/DRW
+            const selectValue = 0x00000000; // APSEL=0, APBANKSEL=0
+            
+            // Batch all operations together with a final DP read to avoid DataView bug
+            // The DP read ensures the response contains at least one data word
+            await proxy.transfer([
+                // 1. Write DP.SELECT to select MEM-AP bank 0
+                { port: DAP_PORT_DEBUG, mode: DAP_TRANSFER_WRITE, register: DP_REG_SELECT, value: selectValue },
+                // 2. Write CSW for 32-bit access
+                { port: DAP_PORT_ACCESS, mode: DAP_TRANSFER_WRITE, register: AP_CSW, value: CSW_VALUE },
+                // 3. Write TAR with target address
+                { port: DAP_PORT_ACCESS, mode: DAP_TRANSFER_WRITE, register: AP_TAR, value: address },
+                // 4. Write DRW with data value
+                { port: DAP_PORT_ACCESS, mode: DAP_TRANSFER_WRITE, register: AP_DRW, value: value },
+                // 5. CRITICAL: Add a DP read to make response contain data words
+                // This works around the DAP.js bug where it tries to read N*4 bytes
+                // from response even for WRITE operations
+                { port: DAP_PORT_DEBUG, mode: DAP_TRANSFER_READ, register: DP_DPIDR }
+            ]);
+        }
+        
         // Flash firmware to device
         async function flashFirmware(dap, firmwareData, startAddress) {
             log(`Flashing ${firmwareData.length} bytes starting at 0x${startAddress.toString(16)}...`, 'info');
@@ -797,17 +849,16 @@
             const dataView = new DataView(paddedData.buffer);
             const totalWords = paddedSize / 4;
             
-            // Use writeMem32 in a loop instead of writeBlock
-            // This avoids the DAP.js transferBlock response parsing bug that causes
-            // "Offset is outside the bounds of the DataView" errors on WRITE operations
-            log(`Writing ${totalWords} words using writeMem32...`, 'info');
+            // Use safeWriteMem32 which works around DAP.js transfer() bug
+            // by adding a DP read to each batch of writes
+            log(`Writing ${totalWords} words using safe memory write...`, 'info');
             
             for (let i = 0; i < totalWords; i++) {
                 const address = startAddress + (i * 4);
                 const word = dataView.getUint32(i * 4, true); // little-endian
                 
                 try {
-                    await dap.writeMem32(address, word);
+                    await safeWriteMem32(dap, address, word);
                 } catch (error) {
                     log(`Error writing word at 0x${address.toString(16)}: ${error.message}`, 'error');
                     throw error;
