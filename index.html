@@ -939,6 +939,17 @@
         // Solution: Use raw DAP_TRANSFER packets via transport.write()/read() and only parse
         // the 3-byte header for write operations. Use single-operation transfers for maximum
         // compatibility with all CMSIS-DAP implementations.
+        //
+        // nRF54L15 RRAMC (Resistive RAM Controller):
+        // The nRF54L15 uses RRAMC instead of NVMC for flash programming. Direct MEM-AP writes
+        // to flash will FAULT unless RRAMC is configured to enable writes. This is done by
+        // writing to the RRAMC CONFIG register before flash operations.
+        // Reference: OpenOCD nrf54l-load procedure writes 0x101 to 0x5004B500 before load_image.
+        //
+        // RRAMC Registers (base 0x5004B000):
+        //   CONFIG (0x500): WEN[0]=1 enables writes, WRITEBUFSIZE[13:8]=1 sets buffer size
+        //   READY (0x400): Bit 0 = 1 when RRAMC is ready
+        //   READYNEXT (0x404): Bit 0 = 1 when RRAMC can accept new write
         async function flashFirmware(dap, firmwareData, startAddress) {
             log(`Flashing ${firmwareData.length} bytes starting at 0x${startAddress.toString(16)}...`, 'info');
             
@@ -949,6 +960,16 @@
             if (!transport) {
                 throw new Error('Could not find transport object in proxy');
             }
+            
+            // nRF54L15 RRAMC register addresses
+            const RRAMC_BASE = 0x5004B000;
+            const RRAMC_CONFIG = RRAMC_BASE + 0x500;      // CONFIG register
+            const RRAMC_READY = RRAMC_BASE + 0x400;       // READY status register
+            const RRAMC_READYNEXT = RRAMC_BASE + 0x404;   // READYNEXT status register
+            
+            // RRAMC CONFIG value: WEN=1 (bit 0), WRITEBUFSIZE=1 (bits 8-13)
+            // This enables writes and sets buffer size to 1 word
+            const RRAMC_CONFIG_VALUE = 0x101;
             
             // Convert firmware data to 32-bit words (pad with 0xFF if needed)
             const paddedSize = Math.ceil(firmwareData.length / 4) * 4;
@@ -988,6 +1009,60 @@
                 register: AP_CSW,
                 value: CSW_VALUE
             }]);
+            
+            // === nRF54L15 RRAMC Initialization ===
+            // Enable RRAMC write mode before flash programming
+            // This is critical - without this, flash writes will FAULT
+            log('Configuring RRAMC for flash programming...', 'info');
+            
+            try {
+                // Read current RRAMC CONFIG to verify access
+                const currentConfig = await dap.readMem32(RRAMC_CONFIG);
+                log(`Current RRAMC CONFIG: 0x${currentConfig.toString(16)}`, 'info');
+                
+                // Write RRAMC CONFIG to enable writes
+                // Use raw DAP transfer to avoid DAP.js bugs
+                await rawDapTransferWrite(transport, [{
+                    port: DAP_PORT_ACCESS,
+                    mode: DAP_TRANSFER_WRITE,
+                    register: AP_TAR,
+                    value: RRAMC_CONFIG
+                }]);
+                await rawDapTransferWrite(transport, [{
+                    port: DAP_PORT_ACCESS,
+                    mode: DAP_TRANSFER_WRITE,
+                    register: AP_DRW,
+                    value: RRAMC_CONFIG_VALUE
+                }]);
+                
+                // Verify RRAMC CONFIG was written
+                const newConfig = await dap.readMem32(RRAMC_CONFIG);
+                log(`New RRAMC CONFIG: 0x${newConfig.toString(16)}`, 'info');
+                
+                if ((newConfig & 0x1) !== 1) {
+                    log('Warning: RRAMC WEN bit not set, flash writes may fail', 'warning');
+                } else {
+                    log('RRAMC write mode enabled successfully', 'success');
+                }
+                
+                // Wait for RRAMC to be ready
+                let ready = await dap.readMem32(RRAMC_READY);
+                let retries = 0;
+                while ((ready & 0x1) === 0 && retries < 100) {
+                    await new Promise(r => setTimeout(r, 10));
+                    ready = await dap.readMem32(RRAMC_READY);
+                    retries++;
+                }
+                
+                if ((ready & 0x1) === 0) {
+                    log('Warning: RRAMC not ready after timeout', 'warning');
+                } else {
+                    log('RRAMC is ready for programming', 'success');
+                }
+            } catch (rramcError) {
+                log(`RRAMC configuration error: ${rramcError.message}`, 'warning');
+                log('Attempting flash write anyway...', 'info');
+            }
             
             // Write firmware word by word using single-operation transfers
             // This is slower but guarantees compatibility with all CMSIS-DAP implementations
